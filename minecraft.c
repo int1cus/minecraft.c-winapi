@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <float.h>
 #include <windows.h>
 #include <string.h>
 #include <time.h>
@@ -14,8 +15,8 @@
 #define VIEW_HEIGHT 0.7f
 #define VIEW_WIDTH 1.0f
 #define BLOCK_BORDER_SIZE 0.05f
-#define MOVE_STEP 0.30f
-#define VIEW_STEP 0.10f
+#define MOVE_SPEED 6.0f
+#define VIEW_SPEED 3.0f
 #define FRAME_DELAY_MS 16
 #define ACTION_DELAY_MS 150
 #define TERRAIN_SCALE 0.18f
@@ -47,6 +48,18 @@ static SMALL_RECT frame_rect = { 0, 0, X_PIXELS - 1, Y_PIXELS - 1 };
 static DWORD last_place_tick = 0;
 static DWORD last_break_tick = 0;
 static unsigned int world_seed = 0;
+
+static inline size_t block_offset(int x, int y, int z) {
+    return ((size_t)z * (size_t)Y_BLOCKS + (size_t)y) * (size_t)X_BLOCKS + (size_t)x;
+}
+
+static inline char block_get(const char* blocks, int x, int y, int z) {
+    return blocks[block_offset(x, y, z)];
+}
+
+static inline void block_set(char* blocks, int x, int y, int z, char value) {
+    blocks[block_offset(x, y, z)] = value;
+}
 
 static void ensure_frame_buffer(void) {
     if (!frame_buffer) {
@@ -239,30 +252,21 @@ static float** init_depth(void) {
     return depth;
 }
 
-static char*** init_blocks(void) {
-    char*** blocks = (char***)malloc(Z_BLOCKS * sizeof(char**));
-    for (int z = 0; z < Z_BLOCKS; ++z) {
-        blocks[z] = (char**)malloc(Y_BLOCKS * sizeof(char*));
-        for (int y = 0; y < Y_BLOCKS; ++y) {
-            blocks[z][y] = (char*)malloc(X_BLOCKS * sizeof(char));
-            memset(blocks[z][y], ' ', X_BLOCKS);
-        }
+static char* init_blocks(void) {
+    size_t total = (size_t)X_BLOCKS * (size_t)Y_BLOCKS * (size_t)Z_BLOCKS;
+    char* blocks = (char*)malloc(total * sizeof(char));
+    if (!blocks) {
+        return NULL;
     }
+    memset(blocks, ' ', total);
     return blocks;
 }
 
-static void free_blocks(char*** blocks) {
-    if (!blocks) return;
-    for (int z = 0; z < Z_BLOCKS; ++z) {
-        for (int y = 0; y < Y_BLOCKS; ++y) {
-            free(blocks[z][y]);
-        }
-        free(blocks[z]);
-    }
+static void free_blocks(char* blocks) {
     free(blocks);
 }
 
-static void generate_tree(char*** blocks, int x, int y, int base_z, unsigned int seed) {
+static void generate_tree(char* blocks, int x, int y, int base_z, unsigned int seed) {
     if (base_z + 1 >= Z_BLOCKS) return;
 
     int extra = (int)(rand01(x, y, seed + 2011u) * (float)(TREE_MAX_HEIGHT + 1));
@@ -274,7 +278,7 @@ static void generate_tree(char*** blocks, int x, int y, int base_z, unsigned int
 
     for (int i = 1; i <= trunk_height; ++i) {
         int z = base_z + i;
-        blocks[z][y][x] = '|';
+        block_set(blocks, x, y, z, '|');
     }
 
     int top_z = base_z + trunk_height;
@@ -292,15 +296,15 @@ static void generate_tree(char*** blocks, int x, int y, int base_z, unsigned int
                 int nx = x + dx;
                 if (nx < 0 || nx >= X_BLOCKS) continue;
                 if (abs(dx) + abs(dy) > radius + 1) continue;
-                if (blocks[z][ny][nx] == ' ') {
-                    blocks[z][ny][nx] = '&';
+                if (block_get(blocks, nx, ny, z) == ' ') {
+                    block_set(blocks, nx, ny, z, '&');
                 }
             }
         }
     }
 }
 
-static void generate_world(char*** blocks, unsigned int seed) {
+static void generate_world(char* blocks, unsigned int seed) {
     for (int y = 0; y < Y_BLOCKS; ++y) {
         for (int x = 0; x < X_BLOCKS; ++x) {
             float nx = (float)x * TERRAIN_SCALE;
@@ -314,17 +318,17 @@ static void generate_world(char*** blocks, unsigned int seed) {
             char surface_block = (ground_height >= SEA_LEVEL) ? '=' : '@';
             for (int z = 0; z <= ground_height && z < Z_BLOCKS; ++z) {
                 if (z == ground_height) {
-                    blocks[z][y][x] = surface_block;
+                    block_set(blocks, x, y, z, surface_block);
                 } else if (ground_height - z >= 2) {
-                    blocks[z][y][x] = '#';
+                    block_set(blocks, x, y, z, '#');
                 } else {
-                    blocks[z][y][x] = '@';
+                    block_set(blocks, x, y, z, '@');
                 }
             }
 
             if (ground_height < SEA_LEVEL) {
                 for (int z = ground_height + 1; z <= SEA_LEVEL && z < Z_BLOCKS; ++z) {
-                    blocks[z][y][x] = '~';
+                    block_set(blocks, x, y, z, '~');
                 }
             } else {
                 float tree_roll = rand01(x, y, seed + 1337u);
@@ -363,61 +367,139 @@ static float minf(float a, float b) {
     return (a < b) ? a : b;
 }
 
-static char raytrace(vect pos, vect dir, char*** blocks, float* out_distance) {
-    const float eps = 0.01f;
+static char raytrace(vect pos, vect dir, const char* blocks, float* out_distance) {
+    if (ray_outside(pos)) {
+        *out_distance = MAX_DISTANCE;
+        return ' ';
+    }
+
+    if (dir.x == 0.0f && dir.y == 0.0f && dir.z == 0.0f) {
+        *out_distance = MAX_DISTANCE;
+        return ' ';
+    }
+
+    int xi = (int)floorf(pos.x);
+    int yi = (int)floorf(pos.y);
+    int zi = (int)floorf(pos.z);
+
+    if (xi < 0 || yi < 0 || zi < 0 || xi >= X_BLOCKS || yi >= Y_BLOCKS || zi >= Z_BLOCKS) {
+        *out_distance = MAX_DISTANCE;
+        return ' ';
+    }
+
+    char c0 = block_get(blocks, xi, yi, zi);
+    if (c0 != ' ') {
+        *out_distance = 0.0f;
+        if (on_block_border(pos)) return '-';
+        return c0;
+    }
+
+    if (dir.z > 0.99f && fabsf(dir.x) < 1e-3f && fabsf(dir.y) < 1e-3f) {
+        int zi_step = zi + 1;
+        const float inv_z = 1.0f / fmaxf(dir.z, 1e-6f);
+        float distance = ((float)zi_step - pos.z) * inv_z;
+        while (distance < MAX_DISTANCE && zi_step < Z_BLOCKS) {
+            char c = block_get(blocks, xi, yi, zi_step);
+            if (c != ' ') {
+                *out_distance = distance;
+                vect hit_pos = vect_add(pos, vect_scale(distance, dir));
+                if (on_block_border(hit_pos)) return '-';
+                return c;
+            }
+            zi_step += 1;
+            distance = ((float)zi_step - pos.z) * inv_z;
+        }
+        *out_distance = MAX_DISTANCE;
+        return ' ';
+    }
+
+    int step_x = 0, step_y = 0, step_z = 0;
+    float tMaxX = FLT_MAX, tMaxY = FLT_MAX, tMaxZ = FLT_MAX;
+    float tDeltaX = FLT_MAX, tDeltaY = FLT_MAX, tDeltaZ = FLT_MAX;
+
+    if (dir.x > 0.0f) {
+        step_x = 1;
+        float offset = ((float)xi + 1.0f) - pos.x;
+        tMaxX = offset / dir.x;
+        tDeltaX = 1.0f / dir.x;
+    } else if (dir.x < 0.0f) {
+        step_x = -1;
+        float offset = pos.x - (float)xi;
+        tMaxX = offset / -dir.x;
+        tDeltaX = 1.0f / -dir.x;
+    }
+
+    if (dir.y > 0.0f) {
+        step_y = 1;
+        float offset = ((float)yi + 1.0f) - pos.y;
+        tMaxY = offset / dir.y;
+        tDeltaY = 1.0f / dir.y;
+    } else if (dir.y < 0.0f) {
+        step_y = -1;
+        float offset = pos.y - (float)yi;
+        tMaxY = offset / -dir.y;
+        tDeltaY = 1.0f / -dir.y;
+    }
+
+    if (dir.z > 0.0f) {
+        step_z = 1;
+        float offset = ((float)zi + 1.0f) - pos.z;
+        tMaxZ = offset / dir.z;
+        tDeltaZ = 1.0f / dir.z;
+    } else if (dir.z < 0.0f) {
+        step_z = -1;
+        float offset = pos.z - (float)zi;
+        tMaxZ = offset / -dir.z;
+        tDeltaZ = 1.0f / -dir.z;
+    }
+
     float distance = 0.0f;
 
-    while (!ray_outside(pos) && distance < MAX_DISTANCE) {
-        int xi = (int)floorf(pos.x);
-        int yi = (int)floorf(pos.y);
-        int zi = (int)floorf(pos.z);
+    while (distance < MAX_DISTANCE) {
+        if (tMaxX < tMaxY) {
+            if (tMaxX < tMaxZ) {
+                distance = tMaxX;
+                tMaxX += tDeltaX;
+                xi += step_x;
+            } else {
+                distance = tMaxZ;
+                tMaxZ += tDeltaZ;
+                zi += step_z;
+            }
+        } else {
+            if (tMaxY < tMaxZ) {
+                distance = tMaxY;
+                tMaxY += tDeltaY;
+                yi += step_y;
+            } else {
+                distance = tMaxZ;
+                tMaxZ += tDeltaZ;
+                zi += step_z;
+            }
+        }
 
         if (xi < 0 || yi < 0 || zi < 0 || xi >= X_BLOCKS || yi >= Y_BLOCKS || zi >= Z_BLOCKS) {
-            break;
+            *out_distance = MAX_DISTANCE;
+            return ' ';
         }
 
-        char c = blocks[zi][yi][xi];
+        if (distance > MAX_DISTANCE) break;
+
+        char c = block_get(blocks, xi, yi, zi);
         if (c != ' ') {
             *out_distance = distance;
-            if (on_block_border(pos)) return '-';
+            vect hit_pos = vect_add(pos, vect_scale(distance, dir));
+            if (on_block_border(hit_pos)) return '-';
             return c;
         }
-
-        float dist = MAX_DISTANCE;
-
-        if (dir.x > eps) {
-            dist = minf(dist, (floorf(pos.x) + 1.0f - pos.x) / dir.x);
-        } else if (dir.x < -eps) {
-            dist = minf(dist, (pos.x - floorf(pos.x)) / -dir.x);
-        }
-
-        if (dir.y > eps) {
-            dist = minf(dist, (floorf(pos.y) + 1.0f - pos.y) / dir.y);
-        } else if (dir.y < -eps) {
-            dist = minf(dist, (pos.y - floorf(pos.y)) / -dir.y);
-        }
-
-        if (dir.z > eps) {
-            dist = minf(dist, (floorf(pos.z) + 1.0f - pos.z) / dir.z);
-        } else if (dir.z < -eps) {
-            dist = minf(dist, (pos.z - floorf(pos.z)) / -dir.z);
-        }
-
-        pos = vect_add(pos, vect_scale(dist + eps, dir));
-        distance += dist + eps;
     }
 
     *out_distance = MAX_DISTANCE;
     return ' ';
 }
 
-static vect** init_directions(vect2 view) {
-    vect** dir = (vect**)malloc(Y_PIXELS * sizeof(vect*));
-    for (int y = 0; y < Y_PIXELS; ++y) {
-        dir[y] = (vect*)malloc(X_PIXELS * sizeof(vect));
-    }
-
-    vect2 tmp_view = view;
+static void get_picture(char** picture, float** depth, player_pos_view posview, const char* blocks) {
+    vect2 tmp_view = posview.view;
     tmp_view.psi -= VIEW_HEIGHT / 2.0f;
     vect screen_down = angles_to_vect(tmp_view);
     tmp_view.psi += VIEW_HEIGHT;
@@ -434,42 +516,29 @@ static vect** init_directions(vect2 view) {
     vect mid_to_left = vect_sub(screen_left, screen_mid_hor);
     vect mid_to_up = vect_sub(screen_up, screen_mid_vert);
 
+    const float inv_x = (X_PIXELS > 1) ? (2.0f / (float)(X_PIXELS - 1)) : 0.0f;
+    const float inv_y = (Y_PIXELS > 1) ? (2.0f / (float)(Y_PIXELS - 1)) : 0.0f;
+    vect step_x = vect_scale(inv_x, mid_to_left);
+    vect step_y = vect_scale(inv_y, mid_to_up);
+
+    vect row_base = vect_add(screen_mid_hor, mid_to_left);
+    row_base = vect_add(row_base, mid_to_up);
+
     for (int y = 0; y < Y_PIXELS; ++y) {
-        float v_factor = ((float)y / (float)(Y_PIXELS - 1)) * 2.0f;
+        vect pixel_vec = row_base;
         for (int x = 0; x < X_PIXELS; ++x) {
-            float h_factor = ((float)x / (float)(X_PIXELS - 1)) * 2.0f;
-            vect tmp = vect_add(screen_mid_hor, mid_to_left);
-            tmp = vect_add(tmp, mid_to_up);
-            tmp = vect_sub(tmp, vect_scale(h_factor, mid_to_left));
-            tmp = vect_sub(tmp, vect_scale(v_factor, mid_to_up));
-            vect_normalize(&tmp);
-            dir[y][x] = tmp;
-        }
-    }
-    return dir;
-}
+            vect dir = pixel_vec;
+            vect_normalize(&dir);
 
-static void free_directions(vect** dir) {
-    if (!dir) return;
-    for (int y = 0; y < Y_PIXELS; ++y) {
-        free(dir[y]);
-    }
-    free(dir);
-}
-
-static void get_picture(char** picture, float** depth, player_pos_view posview, char*** blocks) {
-    vect** directions = init_directions(posview.view);
-
-    for (int y = 0; y < Y_PIXELS; ++y) {
-        for (int x = 0; x < X_PIXELS; ++x) {
             float dist = MAX_DISTANCE;
-            char c = raytrace(posview.pos, directions[y][x], blocks, &dist);
+            char c = raytrace(posview.pos, dir, blocks, &dist);
             picture[y][x] = c;
             depth[y][x] = dist;
-        }
-    }
 
-    free_directions(directions);
+            pixel_vec = vect_sub(pixel_vec, step_x);
+        }
+        row_base = vect_sub(row_base, step_y);
+    }
 }
 
 static void draw_ascii(char** picture, float** depth) {
@@ -535,7 +604,7 @@ static void draw_ascii(char** picture, float** depth) {
     WriteConsoleOutputA(hStdout, frame_buffer, frame_size, origin, &target);
 }
 
-static vect get_current_block(player_pos_view posview, char*** blocks) {
+static vect get_current_block(player_pos_view posview, const char* blocks) {
     vect pos = posview.pos;
     vect dir = angles_to_vect(posview.view);
     const float eps = 0.01f;
@@ -547,7 +616,7 @@ static vect get_current_block(player_pos_view posview, char*** blocks) {
         if (xi < 0 || yi < 0 || zi < 0 || xi >= X_BLOCKS || yi >= Y_BLOCKS || zi >= Z_BLOCKS) {
             break;
         }
-        if (blocks[zi][yi][xi] != ' ') {
+        if (block_get(blocks, xi, yi, zi) != ' ') {
             return pos;
         }
 
@@ -576,7 +645,7 @@ static vect get_current_block(player_pos_view posview, char*** blocks) {
     return pos;
 }
 
-static void place_block(vect pos, char*** blocks, char block) {
+static void place_block(vect pos, char* blocks, char block) {
     int x = clamp_index((int)floorf(pos.x), X_BLOCKS);
     int y = clamp_index((int)floorf(pos.y), Y_BLOCKS);
     int z = clamp_index((int)floorf(pos.z), Z_BLOCKS);
@@ -600,35 +669,38 @@ static void place_block(vect pos, char*** blocks, char block) {
 
     switch (min_idx) {
     case 0:
-        if (x + 1 < X_BLOCKS) blocks[z][y][x + 1] = block;
+        if (x + 1 < X_BLOCKS) block_set(blocks, x + 1, y, z, block);
         break;
     case 1:
-        if (x - 1 >= 0) blocks[z][y][x - 1] = block;
+        if (x - 1 >= 0) block_set(blocks, x - 1, y, z, block);
         break;
     case 2:
-        if (y + 1 < Y_BLOCKS) blocks[z][y + 1][x] = block;
+        if (y + 1 < Y_BLOCKS) block_set(blocks, x, y + 1, z, block);
         break;
     case 3:
-        if (y - 1 >= 0) blocks[z][y - 1][x] = block;
+        if (y - 1 >= 0) block_set(blocks, x, y - 1, z, block);
         break;
     case 4:
-        if (z + 1 < Z_BLOCKS) blocks[z + 1][y][x] = block;
+        if (z + 1 < Z_BLOCKS) block_set(blocks, x, y, z + 1, block);
         break;
     case 5:
-        if (z - 1 >= 0) blocks[z - 1][y][x] = block;
+        if (z - 1 >= 0) block_set(blocks, x, y, z - 1, block);
         break;
     default:
         break;
     }
 }
 
-static void update_pos_view(player_pos_view* posview, char*** blocks) {
-    if (is_key_pressed('w')) posview->view.psi += VIEW_STEP;
-    if (is_key_pressed('s')) posview->view.psi -= VIEW_STEP;
+static void update_pos_view(player_pos_view* posview, const char* blocks, float dt) {
+    float view_step = VIEW_SPEED * dt;
+    float move_step = MOVE_SPEED * dt;
+
+    if (is_key_pressed('w')) posview->view.psi += view_step;
+    if (is_key_pressed('s')) posview->view.psi -= view_step;
     posview->view.psi = clampf(posview->view.psi, -1.2f, 1.2f);
 
-    if (is_key_pressed('d')) posview->view.phi += VIEW_STEP;
-    if (is_key_pressed('a')) posview->view.phi -= VIEW_STEP;
+    if (is_key_pressed('d')) posview->view.phi += view_step;
+    if (is_key_pressed('a')) posview->view.phi -= view_step;
 
     vect forward = angles_to_vect(posview->view);
     vect forward_flat = { forward.x, forward.y, 0.0f };
@@ -638,16 +710,16 @@ static void update_pos_view(player_pos_view* posview, char*** blocks) {
     vect new_pos = posview->pos;
 
     if (is_key_pressed('i')) {
-        new_pos = vect_add(new_pos, vect_scale(MOVE_STEP, forward_flat));
+        new_pos = vect_add(new_pos, vect_scale(move_step, forward_flat));
     }
     if (is_key_pressed('k')) {
-        new_pos = vect_sub(new_pos, vect_scale(MOVE_STEP, forward_flat));
+        new_pos = vect_sub(new_pos, vect_scale(move_step, forward_flat));
     }
     if (is_key_pressed('j')) {
-        new_pos = vect_add(new_pos, vect_scale(MOVE_STEP, right));
+        new_pos = vect_add(new_pos, vect_scale(move_step, right));
     }
     if (is_key_pressed('l')) {
-        new_pos = vect_sub(new_pos, vect_scale(MOVE_STEP, right));
+        new_pos = vect_sub(new_pos, vect_scale(move_step, right));
     }
 
     new_pos.x = clampf(new_pos.x, 0.0f, (float)(X_BLOCKS - 0.001f));
@@ -659,12 +731,12 @@ static void update_pos_view(player_pos_view* posview, char*** blocks) {
     int y = clamp_index((int)floorf(posview->pos.y), Y_BLOCKS);
 
     int z_top = (int)floorf(posview->pos.z - EYE_HEIGHT + 0.01f);
-    if (z_top >= 0 && z_top < Z_BLOCKS && blocks[z_top][y][x] != ' ') {
+    if (z_top >= 0 && z_top < Z_BLOCKS && block_get(blocks, x, y, z_top) != ' ') {
         posview->pos.z = (float)(z_top + 1) + EYE_HEIGHT;
     }
 
     int z_bottom = (int)floorf(posview->pos.z - EYE_HEIGHT - 0.01f);
-    if (z_bottom >= 0 && z_bottom < Z_BLOCKS && blocks[z_bottom][y][x] == ' ') {
+    if (z_bottom >= 0 && z_bottom < Z_BLOCKS && block_get(blocks, x, y, z_bottom) == ' ') {
         posview->pos.z = (float)z_bottom + EYE_HEIGHT;
     }
 
@@ -677,19 +749,27 @@ int main(void) {
 
     char** picture = init_picture();
     float** depth = init_depth();
-    char*** blocks = init_blocks();
+    char* blocks = init_blocks();
     player_pos_view posview = init_posview();
 
     world_seed = (unsigned int)time(NULL);
     generate_world(blocks, world_seed);
 
+    DWORD prev_tick = GetTickCount();
+
     while (1) {
+        DWORD current_tick = GetTickCount();
+        float dt = (float)(current_tick - prev_tick) * 0.001f;
+        if (dt < 0.0f) dt = 0.0f;
+        if (dt > 0.1f) dt = 0.1f;
+        prev_tick = current_tick;
+
         process_input();
         if (is_key_pressed('q')) {
             break;
         }
 
-        update_pos_view(&posview, blocks);
+        update_pos_view(&posview, blocks, dt);
 
         vect current_block = get_current_block(posview, blocks);
         int have_block = !ray_outside(current_block);
@@ -699,14 +779,14 @@ int main(void) {
         char saved_block = ' ';
         int removed = 0;
 
-        DWORD now = GetTickCount();
+        DWORD now = current_tick;
 
         if (have_block) {
-            saved_block = blocks[block_z][block_y][block_x];
-            blocks[block_z][block_y][block_x] = 'o';
+            saved_block = block_get(blocks, block_x, block_y, block_z);
+            block_set(blocks, block_x, block_y, block_z, 'o');
 
             if (is_key_pressed('x') && now - last_break_tick >= ACTION_DELAY_MS) {
-                blocks[block_z][block_y][block_x] = ' ';
+                block_set(blocks, block_x, block_y, block_z, ' ');
                 removed = 1;
                 last_break_tick = now;
             } else if (is_key_pressed(' ') && now - last_place_tick >= ACTION_DELAY_MS) {
@@ -718,7 +798,7 @@ int main(void) {
         get_picture(picture, depth, posview, blocks);
 
         if (have_block && !removed) {
-            blocks[block_z][block_y][block_x] = saved_block;
+            block_set(blocks, block_x, block_y, block_z, saved_block);
         }
 
         draw_ascii(picture, depth);
